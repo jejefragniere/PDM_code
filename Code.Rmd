@@ -4,7 +4,7 @@ output:
   html_document: default
   pdf_document: default
 ---
-##### Welcome to the R code of my master thesis: WILDFIRE RISK ASSESSMENT IN LIGURIA, comparison ##### of two geospatial modelling methods.
+##### Welcome to the R code of my master thesis: WILDFIRE RISK ASSESSMENT IN LIGURIA, comparison of two local geospatial modelling methods.
 
 #### Be careful when you run the chunks entirely because some functions take a lot (really a lot) 
 #### of computing time. Especially don't run the entire chunks "GWR", "GWR_prediction", "GRF" and 
