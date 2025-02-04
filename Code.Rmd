@@ -1,0 +1,586 @@
+---
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+##### Welcome to the R code of my master thesis: WILDFIRE RISK ASSESSMENT IN LIGURIA, comparison ##### of two geospatial modelling methods.
+
+#### Be careful when you run the chunks entirely because some functions take a lot (really a lot) 
+#### of computing time. Especially don't run the entire chunks "GWR", "GWR_prediction", "GRF" and 
+#### "GRF_prediction".
+
+# AUTHOR: M. Jérémie Fragnière, SUPERVISOR: Dr. Marj Tonini
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+```{r libraries, message=FALSE}
+##### loading of the librairies #####
+library(terra)
+library(foreign)
+library(readr) 
+library(ggplot2)  
+library(SpatialML)
+library(GWmodel)
+library(sp)
+library(corrplot)
+library(pROC)
+library(randomForest)
+library(caret)
+library(classInt)
+library(tidyr)
+(.packages())
+```
+
+
+```{r histograms_fire_regime}
+##### Histograms for the Ligurian fire regime #####
+
+# Load the Dataset from Moris et al., 2014
+Lig<-read.csv2("IB_Liguria_1986_2022.csv")
+
+# Keep only the lines with data (it loads 16'328 empty lines I don't know why)
+Lig<-Lig[1:36,]
+
+# Find the non-numeric values and convert them for number of fires
+non_numeric_values1 <- Lig$N_fires[is.na(as.numeric(Lig$N_fires))]
+print(non_numeric_values1)
+Lig$N_fires <- gsub("[^0-9.-]", "", Lig$N_fires)
+Lig$N_fires<-as.numeric(Lig$N_fires)
+
+# Find the non-numeric values and convert them for total burned area 
+non_numeric_values2 <- Lig$BA_tot[is.na(as.numeric(Lig$BA_tot))]
+print(non_numeric_values2)
+Lig$BA_tot <- gsub("[^0-9.-]", "", Lig$BA_tot)
+Lig$BA_tot<-as.numeric(Lig$BA_tot)
+
+
+# Barplot of number of fires 
+ggplot(Lig[11:36,], aes(x = factor(Year), y = N_fires)) +
+  geom_bar(stat = "identity", fill = "lightblue",width=0.5) +
+  labs(x = NULL, y = "Number of wildfires", title = "Number of wildfires (period 1997-2022)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) 
+
+# Barplot of total burned area 
+ggplot(Lig[11:36,], aes(x = factor(Year), y = BA_tot)) +
+  geom_bar(stat = "identity", fill = "lightblue",width=0.5) +
+  labs(x = NULL, y = "Burned area [ha]", title = "Burned area (period 1997-2022)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) 
+```
+
+
+```{r dataset_GWR, message=FALSE, warning=FALSE}
+##### Computing the dataset for the GWR #####
+
+#### Import raster of the independent variables at 100 meter resolution ####
+Slope<-rast("slope.tif")
+DEM<-rast("dem.tif")
+DEM<-crop(DEM, Slope)
+DEM<-project(DEM, Slope)
+Northness<-rast("northness.tif")
+Eastness<-rast("eastness.tif")
+DistTo_Urban<-rast("dist_urban.tif")
+DistTo_Roads<-rast("dist_roads.tif")
+DistTo_Pathways<-rast("dist_pathways.tif")
+Temperature<-rast("maenTemp_resampled.tif")
+Precipitations<-rast("meanPrec_resampled.tif")
+Vegetation<-as.factor(rast("VegAggr.tif"))
+
+#### Plot the rasters ####
+features <- c(DEM,Slope, Northness, Eastness, Vegetation, DistTo_Urban, DistTo_Roads, DistTo_Pathways, Temperature, Precipitations)
+names(features)<-c("DEM","Slope", "Northness", "Eastness", "Vegetation", "DistTo_Urban", "DistTO_Roads", "DistTo_Pathways", "Temperature", "Precipitations")
+features <- terra::mask(features, Slope)
+
+#### Importation of the dependent variable of wildfire occurence #### 
+
+# This dataset contains the presences (1) and absence (0) wildfires observations for a total of 10,000 points 
+# Presence have been extracted randomly for burned areas (Polygon shapefile)
+# Absence have been generated randomly for a same number of points 
+WF_pa <- read.dbf("PresAbs_final_10M.dbf")
+
+#### extraction of the values of the predictors at each location in the WF dataset. ####
+
+# Shuffle the rows
+WF_sh<-WF_pa [sample(nrow(WF_pa), nrow(WF_pa)), ]
+summary(WF_sh)
+class(WF_sh)
+
+# Convert to vector
+WF_vect=vect(WF_sh,geom=c("POINT_X","POINT_Y"),crs=crs(features))
+
+# Extract values from features and add XY coordinates
+WF_inputXY <-terra::extract(features, WF_vect, method="simple",  xy=TRUE)
+
+# Add wildfire presence or absence variable 
+WF_inputXY$WF <- WF_vect$grid_code
+
+# Remove extra column of ID
+WF_inputXY<-na.omit(WF_inputXY)
+WF <- WF_inputXY[,-c(1)]
+
+# Remove the two observations having "Lakes" for vegetation 
+WF<-WF[WF$Vegetation != 10, ]
+
+#### Encode vegetation ####
+
+# dummify and encode the vegetation data
+dmy <- dummyVars(" ~ .", data = WF)
+WF <- data.frame(predict(dmy, newdata = WF))
+
+# Reorganize dataframe
+WF <- WF[,c(19,20,1:4,14:18,6:13,21)]
+WF_GWR<-WF[,-c(10,12)]
+
+# transform the dataframe into spatialpointdataframe for GWR
+coordinates(WF_GWR)<-c("x","y")
+```
+
+```{r GWR}
+##### Geographically weighted regression #####
+
+# Calculate distance matrix
+DM<-gw.dist(dp.locat=coordinates(WF_GWR))
+
+# Find optimal bandwidth 
+bw<- bw.gwr(WF~DEM+Slope+Northness+Eastness+DistTo_Urban+DistTO_Roads+DistTo_Pathways +Precipitations+Vegetation.21+Vegetation.22+Vegetation.23+Vegetation.32+Vegetation.33+Vegetation.34+Vegetation.37, data = WF_GWR, dMat=DM, approach = "AICc", kernel = "gaussian", adaptive = TRUE)
+## Adaptive bandwidth (number of nearest neighbours): 48 AICc value: 7183.805       
+
+#### Model selection procedure ####
+
+# Definition of the dependent variable
+DeVar <- "WF"
+
+# Definition of the independent variables
+InDeVars <- c("DEM","Slope","Northness","Eastness","DistTo_Urban","DistTO_Roads","DistTo_Pathways","Precipitations","Vegetation.21","Vegetation.22","Vegetation.23","Vegetation.32","Vegetation.33","Vegetation.34","Vegetation.37")
+
+# Iterative computation of all the models
+model.sel<-gwr.model.selection(DeVar, InDeVars, data=WF_GWR, bw=48, kernel="gaussian", approach="AIC", adaptive=TRUE,dMat=DM)
+
+# Sorting and plotting of the models
+sorted.models<-model.sort.gwr(model.sel,numVars=length(InDeVars),ruler.vector=model.sel[[2]][,2])
+model.list<-sorted.models[[1]]
+plot(sorted.models[[2]][,2],col="black",pch=20,lty=5,main="GWR model selection procedure",ylab="AICc",xlab="Model number",type="b")
+
+# Compute gegraphically weighted regression 
+gwr<-gwr.basic(WF~DEM+Slope+Northness+Eastness+DistTo_Urban+DistTO_Roads+DistTo_Pathways+Precipitations+Vegetation.22+Vegetation.23+Vegetation.32+Vegetation.33+Vegetation.34+Vegetation.37,data=WF_GWR,bw=48,dMat = DM, kernel="gaussian",adaptive=TRUE)
+
+# Save the model 
+saveRDS(gwr, "gwr.rds")
+
+# Load the model 
+gwr<-readRDS("gwr.rds")
+
+#### Plotting results ####
+
+# Extracting GWR outputs as dataframe 
+gwrdf <- as.data.frame(gwr$SDF)
+
+#### Local R2 ####
+
+# plot
+ggplot() +
+  geom_point(data=gwrdf,aes(x=x,y=y.1,colour=Local_R2),size=1)+
+  scale_color_gradientn(colors = c("white", "yellow","red", "blue"))+
+  labs(fill = "R2", x = "X Coordinate", y = "Y Coordinate")+
+  ggtitle("Local R2")
+
+#### Local T values #### 
+
+# Shrublands 
+ggplot() +
+  geom_point(data=gwrdf,aes(x=x,y=y.1,colour=Northness_TV),size=1)+
+  scale_color_gradientn(colors = c("white", "yellow","red", "blue"))+
+  labs(fill = "R2", x = "X Coordinate", y = "Y Coordinate")+
+  ggtitle("Local T values of shrublands vegetation")
+
+# Agro-forestry area
+ggplot() +
+  geom_point(data=gwrdf,aes(x=x,y=y.1,colour=Vegetation.22_TV),size=1)+
+  scale_color_gradientn(colors = c("white", "yellow","red", "blue"))+
+  labs(fill = "R2", x = "X Coordinate", y = "Y Coordinate")+
+  ggtitle("Local T values of agro-forestry vegetation")
+
+# Slope
+ggplot() +
+  geom_point(data=gwrdf,aes(x=x,y=y.1,colour=Slope_TV),size=1)+
+  scale_color_gradientn(colors = c("white", "yellow","red", "blue"))+
+  labs(fill = "R2", x = "X Coordinate", y = "Y Coordinate")+
+  ggtitle("Local T values of Slope")
+```
+
+```{r GWR_prediction}
+##### Geographically weighted regression as spatial predictor #####
+#### WARNING: Be sure to run the chunk "GRF_prediction" below first to have the required objects. ####
+#### The sets used for GRF where encoded directly to be sure to use the same separated data. ####
+
+# Encode the training set
+dmy_train <- dummyVars(" ~ .", data = WF_RF_train)
+WF_GWR_train <- data.frame(predict(dmy_train, newdata = WF_RF_train))
+
+# Encode the testing set
+dmy_test <- dummyVars(" ~ .", data = WF_RF_test)
+WF_GWR_test <- data.frame(predict(dmy_test, newdata = WF_RF_test))
+
+# Reorganize the dataframe
+WF_GWR_train <- WF_GWR_train[,c(1:6,16:19,9:15,20)]
+WF_GWR_test <- WF_GWR_test[,c(1:6,16:19,9:15,20)]
+
+# Rename the encoded columns 
+colnames(WF_GWR_train)[11]<-"Vegetation.21"
+colnames(WF_GWR_train)[12]<-"Vegetation.22"
+colnames(WF_GWR_train)[13]<-"Vegetation.23"
+colnames(WF_GWR_train)[14]<-"Vegetation.32"
+colnames(WF_GWR_train)[15]<-"Vegetation.33"
+colnames(WF_GWR_train)[16]<-"Vegetation.34"
+colnames(WF_GWR_train)[17]<-"Vegetation.37"
+
+colnames(WF_GWR_test)[11]<-"Vegetation.21"
+colnames(WF_GWR_test)[12]<-"Vegetation.22"
+colnames(WF_GWR_test)[13]<-"Vegetation.23"
+colnames(WF_GWR_test)[14]<-"Vegetation.32"
+colnames(WF_GWR_test)[15]<-"Vegetation.33"
+colnames(WF_GWR_test)[16]<-"Vegetation.34"
+colnames(WF_GWR_test)[17]<-"Vegetation.37"
+
+# Change the dataframes into SpatialPointsDataFrame 
+coordinates(WF_GWR_train)<-c("x","y")
+coordinates(WF_GWR_test)<-c("x","y")
+
+# Calculate the distance matrix
+DM_train<-gw.dist(dp.locat=coordinates(WF_GWR_train))
+DM_test<-gw.dist(dp.locat=coordinates(WF_GWR_train), rp.locat=coordinates(WF_GWR_test))
+
+# Find the optimal bandwidth
+bw_p<- bw.gwr(WF~DEM+Slope+Northness+Eastness+DistTo_Urban+DistTO_Roads+DistTo_Pathways +Precipitations+Vegetation.21+Vegetation.22+Vegetation.23+Vegetation.32+Vegetation.33+Vegetation.34+Vegetation.37, data = WF_GWR_train, dMat=DM_train, approach = "AICc", kernel = "gaussian", adaptive = TRUE)
+## Adaptive bandwidth (number of nearest neighbours): 59 AICc value: 6087.883 
+
+# Compute GWR as spatial predictor 
+pred_gwr<- gwr.predict(WF~DEM+Slope+Northness+Eastness+DistTo_Urban+DistTO_Roads+DistTo_Pathways +Precipitations+Vegetation.21+Vegetation.22+Vegetation.23+Vegetation.32+Vegetation.33+Vegetation.34+Vegetation.37,data=WF_GWR_train,predictdata=WF_GWR_test,bw=59, kernel="gaussian",adaptive=TRUE,dMat1=DM_test,dMat2=DM_train)
+
+saveRDS(pred_gwr,"pred_gwr.rds")
+
+# Calculate RMSPE, MAPE, and z-scores 
+RMSPE_gwr<-(mean((WF_GWR_test$WF - pred_gwr$SDF$prediction)^2))^0.5
+MAPE_gwr <- mean(abs(WF_GWR_test$WF - pred_gwr$SDF$prediction))
+zscore_gwr<-(WF_GWR_test$WF - pred_gwr$SDF$prediction)/(pred_gwr$SDF$prediction_var)^0.5
+MeanZ_gwr<-mean(zscore_gwr)
+SDZ_gwr<-(var(zscore_gwr))^0.5
+
+
+# Plot the ROC curve to assess predictive performance 
+roc_gwr<-roc(WF_GWR_test$WF,pred_gwr$SDF$prediction)
+plot(1-roc_gwr$specificities,roc_gwr$sensitivities, type = 'l', col = 'blue',
+ xlab = "False positive rate", ylab = "True positive rate",main="ROC curve for GWR predictions")
+
+```
+
+```{r dataset_GRF, message=FALSE, warning=FALSE}
+##### Computing the dataset for the GRF #####
+#### Import raster of the independent variables at 100 meter resolution ####
+Slope<-rast("slope.tif")
+DEM<-rast("dem.tif")
+DEM<-crop(DEM, Slope)
+DEM<-project(DEM, Slope)
+Northness<-rast("northness.tif")
+Eastness<-rast("eastness.tif")
+DistTo_Urban<-rast("dist_urban.tif")
+DistTo_Roads<-rast("dist_roads.tif")
+DistTo_Pathways<-rast("dist_pathways.tif")
+Temperature<-rast("maenTemp_resampled.tif")
+Precipitations<-rast("meanPrec_resampled.tif")
+Vegetation<-as.factor(rast("VegAggr.tif"))
+
+#### Name the vegetation classes ####
+
+# Extract current names
+current_levels <- levels(Vegetation)[[1]]
+
+# Create new classes names
+new_class_names <- c(
+ "10" = "Lakes",
+ "11" = "Urban area",
+ "21" = "Arable land, horticulture, permanent grassland",
+ "22" = "Agro-forestry areas",
+ "23" = "Nursery, ochards, olive grove, vineyards",
+ "32" = "Chestnut and ilex groves, pine forests",
+ "33" = "Beech and larch forests",
+ "34" = "Mixed forest",
+ "37" = "Shrublands")
+
+# Ensure that new classes names match the existing levels
+current_levels$VegAggr <- new_class_names[as.character(current_levels$ID)]
+levels(Vegetation) <- current_levels
+print(levels(Vegetation))
+
+#### Plot the rasters ####
+features <- c(DEM,Slope, Northness, Eastness, Vegetation, DistTo_Urban, DistTo_Roads, DistTo_Pathways, Temperature, Precipitations)
+names(features)<-c("DEM","Slope", "Northness", "Eastness", "Vegetation", "DistTo_Urban", "DistTO_Roads", "DistTo_Pathways", "Temperature", "Precipitations")
+features <- terra::mask(features, Slope)
+plot(features)
+
+
+#### Importation of the dependent variable of wildfire occurence #### 
+# This dataset contains the presences (1) and absence (0) wildfires observations for a total of 10,000 points 
+# Presence have been extracted randomly for burned areas (Polygon shapefile)
+# Absence have been generated randomly for a same number of points 
+WF_pa <- read.dbf("PresAbs_final_10M.dbf")
+
+#### extraction of the values of the predictors at each location in the WF dataset. ####
+# Shuffle the rows
+WF_sh<-WF_pa [sample(nrow(WF_pa), nrow(WF_pa)), ]
+summary(WF_sh)
+class(WF_sh)
+# Convert to vector (SpatVector:: point)
+WF_vect=vect(WF_sh,geom=c("POINT_X","POINT_Y"),crs=crs(features))
+# Extract values from features and add XY
+WF_inputXY <-terra::extract(features, WF_vect, method="simple",  xy=TRUE)
+# Add wildfire presence or absence variable 
+WF_inputXY$WF <- WF_vect$grid_code
+# Remove extra column of ID
+WF_inputXY<-na.omit(WF_inputXY)
+WF_RF <- WF_inputXY[,-c(1)]
+
+# Reorganize dataframe
+WF_RF <- WF_RF[,c(11,12,1:8,10,13)]
+WF_RF <- WF_RF[WF_RF$Vegetation != "Lakes", ]
+
+```
+
+
+```{r GRF, message=FALSE, warning=FALSE}
+##### Geographcially weighted random forest #####
+
+# Set the x and y coordinates 
+coords<-WF_RF[,1:2]
+
+# Find optimal bandwidth
+bwrf<-grf.bw(WF~DEM+Slope+Northness+Eastness+DistTo_Urban+DistTO_Roads+DistTo_Pathways
+             +Precipitations+Vegetation,data=WF_RF, kernel="adaptive",coords=coords,bw.min=50,
+             bw.max =65)
+## Bandwidth: 63
+## R2 of Local Model: 0.5978
+
+# Compute geographically weighted random forest 
+grf<-grf(WF~DEM+Slope+Northness+Eastness+DistTo_Urban+DistTO_Roads+DistTo_Pathways
+        +Precipitations+Vegetation,dframe =WF_RF,kernel="adaptive",bw=63,
+        coords=coords)
+
+# Save the model 
+saveRDS(grf, "grf.rds")
+
+# Load the model 
+grf<-readRDS("grf.rds")
+
+#### Plotting results ####
+
+#### Global variable importance ####
+
+# Extract values 
+var_imp<-data.frame(
+  Variable = c("DEM","Slope","Northness","Eastness","DistTo_Urban","DistTO_Roads","DistTo_Pathways","Precipitations","Vegetation"),
+  Importance = c(264.6651,255.8067,229.7007,187.3525,201.2740,167.6852,185.0279,360.7378,447.1773)
+)
+
+# Set color for the three most important features
+var_imp$Color <- ifelse(var_imp$Importance >= sort(var_imp$Importance, decreasing = TRUE)[3], "orange", "skyblue")
+
+# plot
+ggplot(data = var_imp, aes(x = Variable, y = Importance, fill = Color)) +
+  geom_bar(stat = "identity") +
+  scale_fill_identity() +
+  labs(title = "Variable Importance Plot", x = "Variable", y = "Importance") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#### Local R2 #### 
+
+# Extract values
+Rsq<-grf$LGofFit$LM_Rsq100
+
+# Add coordinates 
+Rsq_XY<-as.data.frame(cbind(Rsq,grf$Locations$x,grf$Locations$y))
+colnames(Rsq_XY)[2]<- "X"
+colnames(Rsq_XY)[3]<- "Y"
+
+# Add GWR R2
+Rsq_XY<-cbind(Rsq_XY,gwr$SDF$Local_R2)
+
+# Reshape the data into long format 
+Rsq_XY_long <- Rsq_XY %>%
+  select(Rsq, Local_R2 = `gwr$SDF$Local_R2`) %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value")
+
+# Create boxplot for comparing local R2 distribution of two models 
+ggplot(Rsq_XY_long, aes(x = Variable, y = Value, fill = Variable)) +
+  geom_boxplot() +
+  scale_fill_manual(
+    values = c("skyblue", "orange"),         
+    labels = c("GWR", "GRF")             
+  ) +
+  labs(title = "Distribution of Local R²",
+       x = "Variable",
+       y = "Value",
+       fill = "Model") +                  
+  theme_minimal()
+
+# plot
+ggplot () +
+  geom_point(data = Rsq_XY, aes(x = X, y = Y, colour = Rsq), size = 1)+ 
+  scale_color_gradientn(colors = c("white","yellow" ,"red", "blue"))+
+  labs(title = "R2", x = "X Coordinate", y = "Y Coordinate")+
+  ggtitle("Local R2")
+
+#### Variables Local Importance ####
+
+# Extract values 
+grf_LI<-grf$Local.Variable.Importance
+
+# Add coordinates 
+grf_LI_XY<-cbind(grf_LI,grf$Locations$x,grf$Locations$y)
+colnames(grf_LI_XY)[10]<- "X"
+colnames(grf_LI_XY)[11]<- "Y"
+
+# Define breaks with fisher method for feature importance plots
+vege_vect <- as.vector(grf_LI_XY$Vegetation)
+vege_brk<-(classIntervals(vege_vect, n=5, style = "fisher"))
+vege_brkInt<-round(vege_brk$brks, digits=2)
+print(vege_brkInt)
+
+prec_vect <- as.vector(grf_LI_XY$Precipitations)
+prec_brk<-(classIntervals(prec_vect, n=5, style = "fisher"))
+prec_brkInt<-round(prec_brk$brks, digits=2)
+print(prec_brkInt)
+
+DEM_vect <- as.vector(grf_LI_XY$DEM)
+DEM_brk<-(classIntervals(DEM_vect, n=5, style = "fisher"))
+DEM_brkInt<-round(DEM_brk$brks, digits=2)
+print(DEM_brkInt)
+
+# Plot for Vegetation
+ggplot() +
+    geom_point(data = grf_LI_XY, aes(x = X, y = Y, colour = Vegetation), size = 1) +
+    scale_color_gradientn(colors = c("white", "orange","red", "blue"),  
+                        breaks = c(0.00, 0.33, 0.88, 1.76, 3.28, 7.28), 
+                        labels=c(0.00, 0.33, 0.88, 1.76, 3.28, 7.28)) +
+        labs( x = "X Coordinate", y = "Y Coordinate")+
+    ggtitle("Local average importance of vegetation")
+
+# Plot for Precipitations 
+ggplot() +
+    geom_point(data = grf_LI_XY, aes(x = X, y = Y, colour = Precipitations), size = 1) +
+    scale_color_gradientn(colors = c("white", "orange","red", "blue"),
+                         breaks = c(0.00, 0.60, 1.36, 2.30, 3.64, 7.21), 
+                        labels=c(0.00, 0.60, 1.36, 2.30, 3.64, 7.21)) +
+        labs( x = "X Coordinate", y = "Y Coordinate")+
+    ggtitle("Local average importance of precipitations")
+
+# Plot for Temperature 
+ggplot() +
+    geom_point(data = grf_LI_XY, aes(x = X, y = Y, colour = DEM), size = 1) +
+    scale_color_gradientn(colors = c("white", "orange","red", "blue"),
+                        breaks = c(0.00, 0.62, 1.45, 2.55, 3.88, 6.67), 
+                        labels=c(0.00, 0.62, 1.45, 2.55, 3.88, 6.67)) +
+        labs( x = "X Coordinate", y = "Y Coordinate")+
+    ggtitle("Local average importance of DEM")
+
+```
+
+```{r local_RF package}
+##### Local Random Forest ##### 
+
+# Compute local model
+rf<-randomForest(WF~DEM+Slope+Northness+Eastness+DistTo_Urban+DistTO_Roads+DistTo_Pathways
+                 +Precipitations+Vegetation,data=WF_RF,importance=TRUE)
+
+# Exctract variables importance to make sure that result is the same as GRF
+rf_imp<-importance(rf)
+## Result is the same as GRF
+
+# Calculate R2
+rf_R2 = 1 - sum((rf$y-rf$predicted)^2)/sum((rf$y-mean(rf$y))^2)
+## 0.41
+
+# Partial dependence plot for vegetation. 
+partialPlot(rf, WF_RF, x.var = Precipitations,rug=TRUE, xlab= "Vegetation classes", main = "Importance of vegetation classes", ylab = "Partial dependence")
+
+#### Predictions ####
+
+#Train new model
+rf_p<-rf<-randomForest(WF~DEM+Slope+Northness+Eastness+DistTo_Urban+DistTO_Roads+DistTo_Pathways
+                 +Precipitations+Vegetation,data=WF_RF_train,importance=TRUE)
+
+# Exctract variables importance to make sure that result is the same as GRF
+rf_imp_p<-importance(rf_p)
+## Result is the same as GRF
+
+# Make prediction with new local model 
+pred_rf<-predict(object = rf_p, newdata = WF_RF_test, type="response",predict.all=TRUE)
+
+# Compute variance of the predictions 
+pred_rf_var<-apply(pred_rf$individual,1,var)
+
+# Calculate RMSPE, MAPE, and z-scores 
+RMSPE_rf<-(mean((WF_RF_test$WF - pred_rf$aggregate)^2))^0.5
+MAPE_rf <- mean(abs(WF_RF_test$WF - pred_rf$aggregate))
+zscore_rf<-(WF_RF_test$WF - pred_rf$aggregate)/(pred_rf_var)^0.5
+MeanZ_rf<-mean(zscore_rf)
+SDZ_rf<-(var(zscore_rf))^0.5
+
+
+# Plot the ROC curve to assess predictive performance 
+roc_rf<-roc(WF_RF_test$WF,pred_rf$aggregate)
+plot(1-roc_rf$specificities,roc_rf$sensitivities, type = 'l', col = 'blue',
+ xlab = "False positive rate", ylab = "True positive rate",main="ROC curve for RF global model predictions")
+
+
+```
+
+```{r GRF_prediction}
+##### Geographically weighted random forest as spatial predictor #####
+
+# Split the input dataset into training (80%) and testing (20%)
+n <- nrow (WF_RF)
+n_train <- round(0.80 * n) 
+train_indices <- sample(1:n, n_train)
+WF_RF_train <- WF_RF[train_indices, ]  
+WF_RF_test <- WF_RF[-train_indices, ]
+
+# Set x and y coordinates 
+coords_p<-WF_RF_train[,1:2]
+
+# Find optimal bandwidth 
+bwrf_p<-grf.bw(WF~DEM+Slope+Northness+Eastness+DistTo_Urban+DistTO_Roads+DistTo_Pathways
+        +Precipitations+Vegetation,
+        data=WF_RF_train, kernel="adaptive",coords=coords_p, bw.min=50, bw.max = 65)
+## Best Bandwidth (Based on the Local Model): 59
+## R2 of Local Model: 0.574181709775723
+
+# Compute new model 
+grf_p<-grf(WF~DEM+Slope+Northness+Eastness+DistTo_Urban+DistTO_Roads+DistTo_Pathways
+        +Precipitations+Vegetation,dframe =WF_RF_train,kernel="adaptive",bw=59,
+        coords=coords_p)
+
+# Compute the predictions
+pred_grf<-predict.grf(grf_p,WF_RF_test,x.var.name="x",y.var.name="y",predict.all=TRUE)
+
+# Calculate RMSPE, MAPE, and z-scores 
+RMSPE_grf<-(mean((WF_RF_test$WF - pred_grf)^2))^0.5
+MAPE_grf <- mean(abs(WF_RF_test$WF - pred_grf))
+zscore_grf<-(WF_RF_test$WF - pred_rf$aggregate)/(pred_rf_var)^0.5
+MeanZ_grf<-mean(zscore_rf)
+SDZ_grf<-(var(zscore_rf))^0.5
+
+
+# Plot the ROC curve to assess predictive performance 
+roc_grf<-roc(WF_RF_test$WF,pred_grf)
+plot(1-roc_grf$specificities,roc_grf$sensitivities, type = 'l', col = 'blue',
+ xlab = "False positive rate", ylab = "True positive rate",main="ROC curve for GRF predictions")
+
+
+
+
+```
+
